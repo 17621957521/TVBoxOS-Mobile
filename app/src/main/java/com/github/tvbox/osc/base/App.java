@@ -187,4 +187,24 @@ public class App extends MultiDexApplication {
                 .restartActivity(MainActivity.class) //重新启动后的activity
                 .apply();
     }
+
+    // ==================== 批量嗅探持久化缓存 ====================
+
+    private static final String SNIFF_CACHE_PREFIX = "sniff_cache:";
+
+    public static String getSniffCache(String key) {
+        return Hawk.get(SNIFF_CACHE_PREFIX + key, (String) null);
+    }
+
+    public static void putSniffCache(String key, String resolvedUrl) {
+        Hawk.put(SNIFF_CACHE_PREFIX + key, resolvedUrl == null ? "" : resolvedUrl);
+    }
+
+    public static void removeSniffCache(String key) {
+        Hawk.delete(SNIFF_CACHE_PREFIX + key);
+    }
+
+    public static String buildSniffKey(String sourceKey, String playFlag, String url) {
+        return (sourceKey == null ? "" : sourceKey) + "|" + (playFlag == null ? "" : playFlag) + "|" + (url == null ? "" : url);
+    }
 }

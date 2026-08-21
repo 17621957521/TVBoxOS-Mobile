@@ -164,6 +164,23 @@
                             android:paddingHorizontal="10dp"
                             android:text="下载"
                             android:textColor="@color/text_foreground" />
+
+                        <View
+                            android:layout_width="1dp"
+                            android:layout_height="14dp"
+                            android:background="@color/gray_darker"
+                            android:layout_marginHorizontal="6dp"/>
+                        <TextView
+                            android:id="@+id/tvDownloadAll"
+                            android:layout_width="wrap_content"
+                            android:layout_height="@dimen/dp_40"
+                            android:drawableRight="@drawable/ic_download_18"
+                            android:drawablePadding="6dp"
+                            android:focusable="true"
+                            android:gravity="center"
+                            android:paddingHorizontal="10dp"
+                            android:text="下载全部"
+                            android:textColor="@color/text_foreground" />
                     </LinearLayout>
 
                     <View

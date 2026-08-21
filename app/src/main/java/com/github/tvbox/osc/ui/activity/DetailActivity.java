@@ -16,11 +16,18 @@ import android.graphics.drawable.Icon;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.TextUtils;
 import android.util.Rational;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 import android.widget.Toast;
 
@@ -36,6 +43,7 @@ import com.blankj.utilcode.util.ScreenUtils;
 import com.blankj.utilcode.util.ServiceUtils;
 import com.blankj.utilcode.util.ToastUtils;
 import com.chad.library.adapter.base.BaseQuickAdapter;
+import com.github.catvod.crawler.Spider;
 import com.github.tvbox.osc.R;
 import com.github.tvbox.osc.api.ApiConfig;
 import com.github.tvbox.osc.base.App;
@@ -56,16 +64,19 @@ import com.github.tvbox.osc.ui.adapter.SeriesAdapter;
 import com.github.tvbox.osc.ui.adapter.SeriesFlagAdapter;
 import com.github.tvbox.osc.ui.dialog.AllVodSeriesBottomDialog;
 import com.github.tvbox.osc.ui.dialog.AllVodSeriesRightDialog;
+import com.github.tvbox.osc.ui.dialog.BatchDownloadDialog;
 import com.github.tvbox.osc.ui.dialog.QuickSearchDialog;
 import com.github.tvbox.osc.ui.dialog.VideoDetailDialog;
 import com.github.tvbox.osc.ui.fragment.PlayFragment;
 import com.github.tvbox.osc.ui.widget.LinearSpacingItemDecoration;
+import com.github.tvbox.osc.util.AdBlocker;
 import com.github.tvbox.osc.util.FastClickCheckUtil;
 import com.github.tvbox.osc.util.HawkConfig;
 import com.github.tvbox.osc.util.ScreenShotListenManager;
 import com.github.tvbox.osc.util.SearchHelper;
 import com.github.tvbox.osc.util.SubtitleHelper;
 import com.github.tvbox.osc.util.Utils;
+import com.github.tvbox.osc.util.VideoParseRuler;
 import com.github.tvbox.osc.viewmodel.SourceViewModel;
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
@@ -94,9 +105,11 @@ import java.net.URLEncoder;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * @author pj567
@@ -142,7 +155,11 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
         initView();
         initViewModel();
         initData();
-        registerReceiver(mBatteryReceiver, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(mBatteryReceiver, new IntentFilter(Intent.ACTION_BATTERY_CHANGED), Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(mBatteryReceiver, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        }
         ImmersionBar.with(this)
                 .statusBarColor(R.color.black)
                 .navigationBarColor(R.color.white)
@@ -193,6 +210,12 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
             @Override
             public void onClick(View view) {
                 use1DMDownload();
+            }
+        });
+        findViewById(R.id.tvDownloadAll).setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                startBatchDownload();
             }
         });
         mBinding.tvSort.setOnClickListener(new View.OnClickListener() {
@@ -290,7 +313,11 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
                     }
                 }
             };
-            registerReceiver(mHomeKeyReceiver, new IntentFilter(Intent.ACTION_CLOSE_SYSTEM_DIALOGS));
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(mHomeKeyReceiver, new IntentFilter(Intent.ACTION_CLOSE_SYSTEM_DIALOGS), Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                registerReceiver(mHomeKeyReceiver, new IntentFilter(Intent.ACTION_CLOSE_SYSTEM_DIALOGS));
+            }
         }
     }
 
@@ -726,6 +753,7 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
     @Override
     protected void onDestroy() {
         registerActionReceiver(false);
+        cleanupBatch();
         super.onDestroy();
         unregisterReceiver(mBatteryReceiver);
         // 注销广播接收器
@@ -942,7 +970,11 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
                     }
                 }
             };
-            registerReceiver(mRemoteActionReceiver, new IntentFilter(IntentKey.BROADCAST_ACTION));
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(mRemoteActionReceiver, new IntentFilter(IntentKey.BROADCAST_ACTION), Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                registerReceiver(mRemoteActionReceiver, new IntentFilter(IntentKey.BROADCAST_ACTION));
+            }
         } else {
             if (mRemoteActionReceiver != null) {
                 unregisterReceiver(mRemoteActionReceiver);
@@ -1058,5 +1090,731 @@ public class DetailActivity extends BaseVbActivity<ActivityDetailBinding> {
                 screenShotListenManager.stopListen();
             }
         }
+    }
+
+    // ==================== 批量下载功能 ====================
+
+    /**
+     * 批量嗅探任务条目
+     */
+    private static class SniffTask {
+        final int position;       // 在 series 中的原始位置，用于回写缓存与刷新列表
+        final String name;
+        final String url;
+        String resolvedUrl;
+        volatile boolean done;       // 是否已完成（成功或失败均置 true，避免重复回调）
+        volatile boolean inFlight;  // 是否已被分发到某个槽位
+
+        SniffTask(int position, String name, String url) {
+            this.position = position;
+            this.name = name;
+            this.url = url;
+        }
+    }
+
+    /**
+     * 嗅探槽位：每个槽位持有独立的 WebView / 标志 / 超时 Runnable，支持串行（并发度=1）嗅探，跨任务复用 WebView。
+     */
+    private static class SniffSlot {
+        final int id;
+        WebView webView;
+        final boolean[] found = {false};
+        Runnable timeoutRunnable;
+        SniffTask currentTask;
+        // LiveData observer 引用，便于嗅探完成后反注册
+        Observer<JSONObject> parseObserver;
+
+        SniffSlot(int id) {
+            this.id = id;
+        }
+    }
+
+    private List<SniffTask> mBatchTasks;
+    private final AtomicInteger mBatchDoneCount = new AtomicInteger(0);
+    private final AtomicInteger mBatchDispatchedCount = new AtomicInteger(0);
+    private volatile boolean mBatchCancelled;
+    private final Handler mBatchHandler = new Handler(Looper.getMainLooper());
+    private static final int SNIFF_TIMEOUT = 8000;
+    // 依次（串行）嗅探：并发度=1，单 WebView 槽位跨任务复用，避免并发带来的资源争抢
+    private static final int SNIFF_CONCURRENCY = 1;
+    private final SniffSlot[] mSniffSlots = new SniffSlot[SNIFF_CONCURRENCY];
+    // 弹窗引用，用于实时刷新单项状态
+    private BatchDownloadDialog mBatchDialog;
+
+    /**
+     * 启动批量下载流程：展示选集弹窗，弹窗一出现就读缓存刷新列表并启动依次嗅探
+     */
+    private void startBatchDownload() {
+        if (vodInfo == null || vodInfo.seriesMap == null || vodInfo.seriesMap.get(vodInfo.playFlag) == null) {
+            ToastUtils.showShort("暂无播放数据");
+            return;
+        }
+        List<VodInfo.VodSeries> series = vodInfo.seriesMap.get(vodInfo.playFlag);
+        if (series.isEmpty()) {
+            ToastUtils.showShort("暂无集数数据");
+            return;
+        }
+        // 构建任务列表
+        mBatchTasks = new ArrayList<>();
+        for (int i = 0; i < series.size(); i++) {
+            VodInfo.VodSeries vs = series.get(i);
+            mBatchTasks.add(new SniffTask(i, vodInfo.name + " " + vs.name, vs.url));
+        }
+        mBatchDoneCount.set(0);
+        mBatchDispatchedCount.set(0);
+        mBatchCancelled = false;
+        for (int i = 0; i < SNIFF_CONCURRENCY; i++) {
+            if (mSniffSlots[i] == null) {
+                mSniffSlots[i] = new SniffSlot(i);
+            } else {
+                mSniffSlots[i].currentTask = null;
+                // 保留 webView 实例（若存在）以跨次复用，避免每次重新创建
+                mSniffSlots[i].found[0] = false;
+                mSniffSlots[i].timeoutRunnable = null;
+                mSniffSlots[i].parseObserver = null;
+                if (mSniffSlots[i].webView != null) {
+                    try {
+                        mSniffSlots[i].webView.stopLoading();
+                        mSniffSlots[i].webView.setWebViewClient(null);
+                        mSniffSlots[i].webView.loadUrl("about:blank");
+                        mSniffSlots[i].webView.clearHistory();
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        }
+
+        // 显示弹窗（列表默认全不可点击）
+        mBatchDialog = new BatchDownloadDialog(this, series, this::onBatchDownloadItemClick, this::onResniff,
+                () -> {
+                    // 弹窗关闭时彻底销毁 WebView 池，释放内存
+                    mBatchCancelled = true;
+                    cleanupBatch();
+                });
+        new XPopup.Builder(this)
+                .isViewMode(true)
+                .hasNavigationBar(false)
+                .maxHeight(ScreenUtils.getScreenHeight() - (ScreenUtils.getScreenHeight() / 4))
+                .asCustom(mBatchDialog)
+                .show();
+
+        // 预创建 WebView 池（首批任务可直接复用，避免串行现场初始化）
+        runOnUiThread(this::ensureWebViewPool);
+
+        // 先按已嗅探过的缓存刷新弹窗（持久化缓存，应用被杀后下次打开仍可读取）。
+        // 注意：只有成功项（非空串）命中跳过；失败项（空串缓存）不标记 done，会被依次嗅探重试。
+        for (SniffTask task : mBatchTasks) {
+            String key = App.buildSniffKey(sourceKey, vodInfo.playFlag, task.url);
+            String cached = App.getSniffCache(key);
+            if (cached != null && !cached.isEmpty()) {
+                task.resolvedUrl = cached;
+                task.done = true;
+                int pos = task.position;
+                int done = mBatchDoneCount.incrementAndGet();
+                runOnUiThread(() -> {
+                    if (mBatchDialog != null) {
+                        mBatchDialog.markItemSuccess(pos);
+                        mBatchDialog.updateProgress(done, mBatchTasks.size(), "已嗅探");
+                    }
+                });
+            }
+        }
+
+        // 启动依次嗅探（dispatchNextTask 会自动跳过 done 的项，失败项会被重新嗅探）
+        int initial = Math.min(SNIFF_CONCURRENCY, mBatchTasks.size());
+        for (int i = 0; i < initial; i++) {
+            dispatchNextTask(i);
+        }
+    }
+
+    /**
+     * 重新嗅探回调：清空当前列表对应的缓存、重置任务与弹窗、重启依次嗅探。
+     */
+    private void onResniff() {
+        if (mBatchTasks == null || mBatchTasks.isEmpty()) return;
+
+        // 1. 先停掉当前在飞的嗅探（软清理：保留 WebView 池以便复用，避免重复创建）
+        mBatchCancelled = true;
+        cleanupAllSlots(false);
+        mBatchCancelled = false;
+
+        // 2. 清空当前列表对应的缓存（成功和失败的都清掉，保证全部重新嗅探）
+        for (SniffTask task : mBatchTasks) {
+            String key = App.buildSniffKey(sourceKey, vodInfo.playFlag, task.url);
+            App.removeSniffCache(key);
+        }
+
+        // 3. 重置任务状态
+        for (SniffTask task : mBatchTasks) {
+            task.resolvedUrl = null;
+            task.done = false;
+            task.inFlight = false;
+        }
+        mBatchDoneCount.set(0);
+        mBatchDispatchedCount.set(0);
+
+        // 4. 重置弹窗 UI（全部项变灰、进度归零）
+        if (mBatchDialog != null) {
+            mBatchDialog.resetAll();
+        }
+
+        // 5. 确保 WebView 池就绪（首次/重建后预创建，否则复用已有）
+        ensureWebViewPool();
+
+        // 6. 重启依次嗅探
+        int initial = Math.min(SNIFF_CONCURRENCY, mBatchTasks.size());
+        for (int i = 0; i < initial; i++) {
+            dispatchNextTask(i);
+        }
+    }
+
+    /**
+     * 弹窗列表项点击回调：仅 selected=true（嗅探成功）才会回调。
+     * 直接调用 1DM+ 启动下载，使用嗅探到的 URL，文件名 = "剧名_集名.mp4"
+     */
+    private void onBatchDownloadItemClick(int position, VodInfo.VodSeries item) {
+        if (mBatchTasks == null || position < 0 || position >= mBatchTasks.size()) return;
+        SniffTask task = mBatchTasks.get(position);
+        if (TextUtils.isEmpty(task.resolvedUrl)) return;
+        String safeName = task.name == null ? "" : task.name.replace(" ", "_") + ".mp4";
+        sendUrlTo1DM(task.resolvedUrl, safeName);
+    }
+
+    /**
+     * 发送单个 URL 到 1DM+ 启动下载。
+     */
+    private void sendUrlTo1DM(String url, String fileName) {
+        Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+        intent.setDataAndType(Uri.parse(url), "video/mp4");
+        intent.putExtra("title", fileName);
+        intent.setClassName("idm.internet.download.manager.plus", "idm.internet.download.manager.Downloader");
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+
+        PackageManager pm = getPackageManager();
+        List<ResolveInfo> activities = pm.queryIntentActivities(intent, 0);
+        if (activities.isEmpty()) {
+            AlertDialog.Builder builder = new AlertDialog.Builder(this);
+            builder.setTitle("未安装 1DM+");
+            builder.setMessage("已嗅探到下载地址。\n如需直接下载，请安装 1DM+ 下载管理器。是否现在安装？");
+            builder.setPositiveButton("立即下载", (dialog, which) -> {
+                Intent downloadIntent = new Intent(Intent.ACTION_VIEW, Uri.parse("https://od.lk/d/MzRfMTg0NTcxMDdf/1DM _v15.6.apk"));
+                downloadIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(downloadIntent);
+            });
+            builder.setNegativeButton("取消", null);
+            builder.show();
+            return;
+        }
+        startActivity(intent);
+        ToastUtils.showShort("已发送到 1DM+");
+    }
+
+    /**
+     * 调度下一个待嗅探任务到指定槽位（并发度=1 时只有 slot 0，实现依次串行）。
+     * 调度规则：从尚未分发的任务里取下一个；如已无任务，则不调度（仅等待未完成槽位收尾）。
+     */
+    private void dispatchNextTask(int slotId) {
+        if (mBatchCancelled || mBatchTasks == null) {
+            return;
+        }
+        SniffTask next = null;
+        synchronized (mBatchTasks) {
+            for (int i = 0; i < mBatchTasks.size(); i++) {
+                SniffTask t = mBatchTasks.get(i);
+                if (!t.inFlight && !t.done) {
+                    t.inFlight = true;
+                    next = t;
+                    break;
+                }
+            }
+        }
+        if (next == null) {
+            return;
+        }
+        int dispatched = mBatchDispatchedCount.incrementAndGet();
+        updateBatchDialogProgress(dispatched - 1, mBatchTasks.size(), "正在嗅探: " + next.name);
+        processBatchTask(slotId, next);
+    }
+
+    /**
+     * 处理单个批量任务（在指定槽位上）
+     */
+    private void processBatchTask(int slotId, SniffTask task) {
+        SniffSlot slot = mSniffSlots[slotId];
+        slot.currentTask = task;
+        slot.found[0] = false;
+
+        // 使用 sourceViewModel.getPlay() 获取播放信息。注意：playResult 是共享 LiveData，
+        // 多路并发嗅探时所有 observer 都会被任一请求 postValue 触发。
+        // 修复：必须用 info.key（== 调用 getPlay 时传入的 url）识别是不是本 task 的请求结果，
+        // 不匹配的直接跳过；null 也跳过，让本槽位超时兜底，避免误标其他 task 失败。
+        Observer<JSONObject> observer = new Observer<JSONObject>() {
+            @Override
+            public void onChanged(JSONObject info) {
+                if (task.done) {
+                    sourceViewModel.playResult.removeObserver(this);
+                    return;
+                }
+                // 只处理属于本 task 的请求结果（key == task.url）
+                if (info == null) {
+                    return; // 其他请求失败的 null，不处理，等本 task 超时或自己的结果
+                }
+                String key = info.optString("key", "");
+                if (!task.url.equals(key)) {
+                    return; // 不是我发起的请求结果，忽略
+                }
+                sourceViewModel.playResult.removeObserver(this);
+                if (mBatchCancelled) {
+                    onBatchTaskDone(slot, task);
+                    return;
+                }
+                try {
+                    boolean parse = info.optString("parse", "1").equals("1");
+                    boolean jx = info.optString("jx", "0").equals("1");
+                    String playUrl = info.optString("playUrl", "");
+                    String url = info.getString("url");
+                    String flag = info.optString("flag");
+                    if (!parse && !jx) {
+                        task.resolvedUrl = playUrl + url;
+                        onBatchTaskDone(slot, task);
+                    } else {
+                        boolean userJxList = (playUrl.isEmpty() && ApiConfig.get().getVipParseFlags().contains(flag)) || jx;
+                        resolveWithParse(userJxList, playUrl, url, slot, task);
+                    }
+                } catch (Throwable th) {
+                    task.resolvedUrl = "";
+                    onBatchTaskDone(slot, task);
+                }
+            }
+        };
+        slot.parseObserver = observer;
+        sourceViewModel.playResult.observe(this, observer);
+        sourceViewModel.getPlay(sourceKey, vodInfo.playFlag, "", task.url, "");
+    }
+
+    /**
+     * 解析需要嗅探的URL（在指定槽位上）
+     */
+    private void resolveWithParse(boolean useParse, String playUrl, String url, SniffSlot slot, SniffTask task) {
+        ParseBean parseBean = null;
+        if (useParse) {
+            parseBean = ApiConfig.get().getDefaultParse();
+        } else {
+            if (playUrl.startsWith("json:")) {
+                parseBean = new ParseBean();
+                parseBean.setType(1);
+                parseBean.setUrl(playUrl.substring(5));
+            } else if (playUrl.startsWith("parse:")) {
+                String parseRedirect = playUrl.substring(6);
+                for (ParseBean pb : ApiConfig.get().getParseBeanList()) {
+                    if (pb.getName().equals(parseRedirect)) {
+                        parseBean = pb;
+                        break;
+                    }
+                }
+            }
+            if (parseBean == null) {
+                parseBean = new ParseBean();
+                parseBean.setType(0);
+                parseBean.setUrl(playUrl);
+            }
+        }
+
+        if (parseBean.getType() == 1) {
+            resolveWithJsonParse(parseBean, url, slot, task);
+        } else if (parseBean.getType() == 0) {
+            sniffWithWebView(parseBean, url, slot, task);
+        } else {
+            task.resolvedUrl = url;
+            onBatchTaskDone(slot, task);
+        }
+    }
+
+    /**
+     * JSON 方式解析（在指定槽位上）
+     */
+    private void resolveWithJsonParse(ParseBean pb, String url, SniffSlot slot, SniffTask task) {
+        OkGo.<String>get(pb.getUrl() + encodeUrl(url))
+                .tag("batch_json_jx")
+                .execute(new AbsCallback<String>() {
+                    @Override
+                    public String convertResponse(okhttp3.Response response) throws Throwable {
+                        return response.body() != null ? response.body().string() : "";
+                    }
+
+                    @Override
+                    public void onSuccess(Response<String> response) {
+                        try {
+                            JSONObject rs = jsonParseSimple(url, response.body());
+                            if (rs != null) {
+                                task.resolvedUrl = rs.optString("url", "");
+                            }
+                        } catch (Throwable e) {
+                            e.printStackTrace();
+                        }
+                        onBatchTaskDone(slot, task);
+                    }
+
+                    @Override
+                    public void onError(Response<String> response) {
+                        super.onError(response);
+                        onBatchTaskDone(slot, task);
+                    }
+                });
+    }
+
+    /**
+     * 简化版 JSON 解析
+     */
+    private JSONObject jsonParseSimple(String input, String json) throws org.json.JSONException {
+        JSONObject jsonPlayData = new JSONObject(json);
+        String url;
+        if (jsonPlayData.has("data")) {
+            url = jsonPlayData.getJSONObject("data").getString("url");
+        } else {
+            url = jsonPlayData.getString("url");
+        }
+        if (url.startsWith("//")) {
+            url = "http:" + url;
+        }
+        if (!url.startsWith("http")) {
+            return null;
+        }
+        JSONObject taskResult = new JSONObject();
+        taskResult.put("url", url);
+        return taskResult;
+    }
+
+    /**
+     * WebView 嗅探（每个槽位独立 WebView，跨任务复用避免反复创建开销）
+     */
+    private void sniffWithWebView(ParseBean pb, String videoUrl, SniffSlot slot, SniffTask task) {
+        runOnUiThread(() -> {
+            if (mBatchCancelled) {
+                onBatchTaskDone(slot, task);
+                return;
+            }
+            // 复用 WebView：池已预创建则直接复用；否则现场初始化（仅首次/被销毁后）。
+            // 关键优化点：跨任务保留 WebView 实例，避免 JS 引擎、内核反复初始化带来的耗时。
+            if (slot.webView == null) {
+                ensureSlotWebView(slot);
+            } else {
+                // 复用前清理上次任务残留（不清磁盘缓存，避免下次重新加载资源变慢）
+                try {
+                    slot.webView.stopLoading();
+                    slot.webView.setWebViewClient(null);
+                    slot.webView.loadUrl("about:blank");
+                    slot.webView.clearHistory();
+                    slot.webView.clearFormData();
+                } catch (Throwable ignored) {
+                }
+            }
+            slot.found[0] = false;
+
+            String webUserAgent = null;
+            HashMap<String, String> webHeaders = null;
+            if (pb.getExt() != null) {
+                try {
+                    JSONObject jsonObject = new JSONObject(pb.getExt());
+                    if (jsonObject.has("header")) {
+                        JSONObject headerJson = jsonObject.optJSONObject("header");
+                        Iterator<String> keys = headerJson.keys();
+                        while (keys.hasNext()) {
+                            String key = keys.next();
+                            if (key.equalsIgnoreCase("user-agent")) {
+                                webUserAgent = headerJson.getString(key).trim();
+                            } else if (webHeaders == null) {
+                                webHeaders = new HashMap<>();
+                                webHeaders.put(key, headerJson.optString(key, ""));
+                            }
+                        }
+                    }
+                } catch (Throwable e) {
+                    e.printStackTrace();
+                }
+            }
+
+            final String finalWebUserAgent = webUserAgent;
+            final HashMap<String, String> finalWebHeaders = webHeaders;
+            final Map<String, Boolean> loadedUrls = new HashMap<>();
+
+            // 每次任务都要重设 WebViewClient（闭包捕获了本次 task，避免上次任务的回调误触发）
+            slot.webView.setWebViewClient(new WebViewClient() {
+                @Override
+                public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                    String reqUrl = request.getUrl().toString();
+                    if (slot.found[0]) return null;
+                    boolean ad;
+                    if (!loadedUrls.containsKey(reqUrl)) {
+                        ad = AdBlocker.isAd(reqUrl);
+                        loadedUrls.put(reqUrl, ad);
+                    } else {
+                        ad = Boolean.TRUE.equals(loadedUrls.get(reqUrl));
+                    }
+                    if (!ad) {
+                        if (checkBatchVideoFormat(reqUrl)) {
+                            slot.found[0] = true;
+                            if (slot.timeoutRunnable != null) {
+                                mBatchHandler.removeCallbacks(slot.timeoutRunnable);
+                            }
+                            task.resolvedUrl = reqUrl;
+                            // 复用模式下不销毁 WebView，只停止加载，下个任务会复用
+                            runOnUiThread(() -> {
+                                try {
+                                    if (slot.webView != null) {
+                                        slot.webView.stopLoading();
+                                        slot.webView.loadUrl("about:blank");
+                                    }
+                                } catch (Throwable ignored) {
+                                }
+                                onBatchTaskDone(slot, task);
+                            });
+                        }
+                    }
+                    return null;
+                }
+            });
+
+            if (finalWebUserAgent != null) {
+                slot.webView.getSettings().setUserAgentString(finalWebUserAgent);
+            }
+
+            slot.timeoutRunnable = () -> {
+                if (!slot.found[0]) {
+                    slot.found[0] = true;
+                    // 超时仅停止加载，不销毁 WebView（下个任务复用）
+                    try {
+                        if (slot.webView != null) {
+                            slot.webView.stopLoading();
+                            slot.webView.loadUrl("about:blank");
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                    onBatchTaskDone(slot, task);
+                }
+            };
+            mBatchHandler.postDelayed(slot.timeoutRunnable, SNIFF_TIMEOUT);
+
+            String fullUrl = pb.getUrl() + videoUrl;
+            if (finalWebHeaders != null) {
+                slot.webView.loadUrl(fullUrl, finalWebHeaders);
+            } else {
+                slot.webView.loadUrl(fullUrl);
+            }
+        });
+    }
+
+    /**
+     * 检查是否为视频URL
+     */
+    private boolean checkBatchVideoFormat(String url) {
+        try {
+            if (url.contains("url=http") || url.contains(".html")) {
+                return false;
+            }
+            SourceBean sourceBean = ApiConfig.get().getSource(sourceKey);
+            if (sourceBean.getType() == 3) {
+                Spider sp = ApiConfig.get().getCSP(sourceBean);
+                if (sp != null && sp.manualVideoCheck()) {
+                    return sp.isVideoFormat(url);
+                }
+            }
+            return VideoParseRuler.checkIsVideoForParse("", url);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * 单个任务完成：CAS 防重复回调、写缓存、刷新弹窗、调度本槽位下一个任务。
+     */
+    private void onBatchTaskDone(SniffSlot slot, SniffTask task) {
+        if (task.done) {
+            return;
+        }
+        synchronized (mBatchTasks) {
+            if (task.done) return;
+            task.done = true;
+        }
+        if (slot.parseObserver != null) {
+            sourceViewModel.playResult.removeObserver(slot.parseObserver);
+            slot.parseObserver = null;
+        }
+        // 软清理：保留 WebView 实例供下一个任务复用（避免反复创建 WebView / JS 引擎初始化）
+        resetSlotState(slot);
+        slot.currentTask = null;
+
+        // 写入持久化缓存（失败也写入空串，下次若显式开启弹窗仍会重嗅探失败项，因为成功缓存判断是 !cached.isEmpty()）
+        String key = App.buildSniffKey(sourceKey, vodInfo.playFlag, task.url);
+        App.putSniffCache(key, task.resolvedUrl == null ? "" : task.resolvedUrl);
+
+        int done = mBatchDoneCount.incrementAndGet();
+        int total = mBatchTasks == null ? done : mBatchTasks.size();
+        // 刷新弹窗单项状态与进度
+        final int pos = task.position;
+        final boolean success = !TextUtils.isEmpty(task.resolvedUrl);
+        final int finalDone = done;
+        runOnUiThread(() -> {
+            if (mBatchDialog != null) {
+                if (success) {
+                    mBatchDialog.markItemSuccess(pos);
+                } else {
+                    mBatchDialog.markItemFailed(pos);
+                }
+                mBatchDialog.updateProgress(finalDone, total, finalDone >= total ? "完成" : "嗅探中…");
+            }
+        });
+
+        if (mBatchCancelled) {
+            if (mBatchDoneCount.get() >= total || allSlotsIdle()) {
+                cleanupBatch();
+            }
+            return;
+        }
+
+        if (done >= total) {
+            // 全部完成
+            runOnUiThread(() -> ToastUtils.showShort("批量嗅探完成"));
+            return;
+        }
+        // 本槽位调度下一个任务（并发度=1 时就是依次串行）
+        dispatchNextTask(slot.id);
+    }
+
+    /**
+     * 是否所有槽位都已空闲（无 currentTask）
+     */
+    private boolean allSlotsIdle() {
+        for (int i = 0; i < SNIFF_CONCURRENCY; i++) {
+            if (mSniffSlots[i] != null && mSniffSlots[i].currentTask != null) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 更新弹窗进度（如果弹窗存在）
+     */
+    private void updateBatchDialogProgress(int done, int total, String detail) {
+        runOnUiThread(() -> {
+            if (mBatchDialog != null) {
+                mBatchDialog.updateProgress(done, total, detail);
+            }
+        });
+    }
+
+    /**
+     * 软清理槽位：仅取消超时 Runnable、解绑 WebViewClient、停掉当前加载。
+     * 保留 WebView 实例供下一个任务复用（关键性能优化点：WebView/JS 引擎初始化开销大）。
+     */
+    private void resetSlotState(SniffSlot slot) {
+        if (slot == null) return;
+        if (slot.timeoutRunnable != null) {
+            mBatchHandler.removeCallbacks(slot.timeoutRunnable);
+            slot.timeoutRunnable = null;
+        }
+        slot.found[0] = false;
+        if (slot.webView != null) {
+            try {
+                slot.webView.stopLoading();
+                // 解绑上次的 WebViewClient，避免下个任务 loadUrl 前的旧回调误触发
+                slot.webView.setWebViewClient(null);
+                slot.webView.loadUrl("about:blank");
+                slot.webView.clearHistory();
+                slot.webView.clearFormData();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    /**
+     * 硬销毁槽位 WebView：仅在弹窗真正关闭 / Activity 销毁时调用，释放内存。
+     */
+    private void destroySlotWebView(SniffSlot slot) {
+        if (slot == null) return;
+        if (slot.timeoutRunnable != null) {
+            mBatchHandler.removeCallbacks(slot.timeoutRunnable);
+            slot.timeoutRunnable = null;
+        }
+        slot.found[0] = false;
+        if (slot.webView != null) {
+            try {
+                slot.webView.stopLoading();
+                slot.webView.setWebViewClient(null);
+                slot.webView.loadUrl("about:blank");
+                slot.webView.removeAllViews();
+                slot.webView.destroy();
+            } catch (Throwable ignored) {
+            }
+            slot.webView = null;
+        }
+    }
+
+    /**
+     * 预创建全部槽位的 WebView（仅初始化尚未创建的槽位）。
+     * 在主线程同步创建：弹窗 show 之后调用，让首批嗅探任务直接复用而非现场初始化。
+     */
+    private void ensureWebViewPool() {
+        if (mBatchCancelled) return;
+        for (int i = 0; i < SNIFF_CONCURRENCY; i++) {
+            SniffSlot slot = mSniffSlots[i];
+            if (slot == null) {
+                slot = new SniffSlot(i);
+                mSniffSlots[i] = slot;
+            }
+            if (slot.webView == null && !mBatchCancelled) {
+                ensureSlotWebView(slot);
+            }
+        }
+    }
+
+    /**
+     * 创建并配置单个槽位的 WebView（仅初始化一次），后续任务复用此实例。
+     */
+    private void ensureSlotWebView(SniffSlot slot) {
+        if (slot.webView != null) return;
+        WebView webView = new WebView(this);
+        ViewGroup.LayoutParams params = new ViewGroup.LayoutParams(1, 1);
+        webView.setLayoutParams(params);
+        addContentView(webView, params);
+
+        WebSettings settings = webView.getSettings();
+        settings.setJavaScriptEnabled(true);
+        settings.setDomStorageEnabled(true);
+        settings.setBlockNetworkImage(true);
+        settings.setMediaPlaybackRequiresUserGesture(false);
+        settings.setAllowFileAccess(true);
+        settings.setCacheMode(WebSettings.LOAD_NO_CACHE);
+
+        slot.webView = webView;
+    }
+
+    /**
+     * 清理全部槽位：destroy=true 销毁 WebView（弹窗关闭/Activity 销毁），destroy=false 仅软清理（重新嗅探时复用池）。
+     */
+    private void cleanupAllSlots(boolean destroy) {
+        for (int i = 0; i < SNIFF_CONCURRENCY; i++) {
+            SniffSlot s = mSniffSlots[i];
+            if (s == null) continue;
+            if (destroy) {
+                destroySlotWebView(s);
+            } else {
+                resetSlotState(s);
+            }
+            s.currentTask = null;
+            s.parseObserver = null;
+            s.found[0] = false;
+        }
+        mBatchHandler.removeCallbacksAndMessages(null);
+    }
+
+    /**
+     * 清理批量下载资源（不删缓存，缓存持久化保留）
+     */
+    private void cleanupBatch() {
+        cleanupAllSlots(true);
+        mBatchDialog = null;
+        mBatchTasks = null;
     }
 }

@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/bg"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_gravity="center"
+    android:background="@drawable/bg_bottom_dialog"
+    android:orientation="vertical"
+    android:paddingTop="20dp"
+    android:paddingBottom="10dp"
+    android:gravity="center_horizontal">
+
+    <com.lihang.ShadowLayout
+        android:id="@+id/v_gesture_line"
+        android:layout_width="30dp"
+        android:layout_height="2dp"
+        app:hl_cornerRadius="10dp"
+        app:hl_layoutBackground="@color/gray_darker" />
+
+    <ProgressBar
+        android:id="@+id/pbSniff"
+        style="?android:attr/progressBarStyleHorizontal"
+        android:layout_width="320dp"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:layout_marginHorizontal="20dp"
+        android:indeterminate="false"
+        android:max="100"
+        android:progress="0"
+        android:progressTint="@color/colorPrimary" />
+
+    <TextView
+        android:id="@+id/tvSniffStatus"
+        android:layout_width="320dp"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:layout_gravity="center_horizontal"
+        android:gravity="center"
+        android:textColor="@color/text_foreground"
+        android:textSize="12sp"
+        tools:text="0/20  嗅探中…" />
+
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/rv"
+        android:layout_width="360dp"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:layout_marginTop="10dp"
+        android:layout_gravity="center_horizontal"
+        android:scrollbars="vertical"
+        android:overScrollMode="ifContentScrolls"
+        tools:listitem="@layout/item_series" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center"
+        android:layout_marginTop="10dp"
+        android:layout_marginHorizontal="20dp">
+
+        <TextView
+            android:id="@+id/tvResniff"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="40dp"
+            android:gravity="center"
+            android:text="重新嗅探"
+            android:textColor="@color/colorPrimary"
+            android:background="@drawable/bg_small_round_gray"
+            android:layout_marginEnd="10dp" />
+
+        <TextView
+            android:id="@+id/tvClose"
+            android:layout_width="0dp"
+            android:layout_weight="1"
+            android:layout_height="40dp"
+            android:gravity="center"
+            android:text="关闭"
+            android:textColor="@color/text_foreground"
+            android:background="@drawable/bg_small_round_gray" />
+    </LinearLayout>
+
+</LinearLayout>

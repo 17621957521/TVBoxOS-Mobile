@@ -23,6 +23,7 @@ import java.util.ArrayList;
  */
 public class SeriesAdapter extends BaseQuickAdapter<VodInfo.VodSeries, BaseViewHolder> {
     private boolean isGird;
+    private boolean downloadMode = false;
 
     public SeriesAdapter(boolean isGird) {
         super(R.layout.item_series, new ArrayList<>());
@@ -36,6 +37,20 @@ public class SeriesAdapter extends BaseQuickAdapter<VodInfo.VodSeries, BaseViewH
         sl.setSelected(item.selected);
         tvSeries.setText(item.name);
 
+        if (downloadMode) {
+            // 批量下载：selected=true 表示嗅探成功可下载；未成功项禁用点击并半透明
+            sl.setEnabled(item.selected);
+            sl.setClickable(item.selected);
+            tvSeries.setEnabled(item.selected);
+            tvSeries.setAlpha(item.selected ? 1.0f : 0.45f);
+        } else {
+            // 正常选集播放：不禁用点击，selected 仅高亮当前播放集
+            sl.setEnabled(true);
+            sl.setClickable(true);
+            tvSeries.setEnabled(true);
+            tvSeries.setAlpha(1.0f);
+        }
+
         if (!isGird){// 详情页横向展示时固定宽度
             ViewGroup.LayoutParams layoutParams = sl.getLayoutParams();
             layoutParams.width = ConvertUtils.dp2px(120);
@@ -45,6 +60,10 @@ public class SeriesAdapter extends BaseQuickAdapter<VodInfo.VodSeries, BaseViewH
 
     public void setGird(boolean gird) {
         isGird = gird;
+    }
+
+    public void setDownloadMode(boolean downloadMode) {
+        this.downloadMode = downloadMode;
     }
 
 }
